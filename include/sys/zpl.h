@@ -68,6 +68,9 @@ extern const struct super_operations zpl_super_operations;
 extern const struct export_operations zpl_export_operations;
 extern struct file_system_type zpl_fs_type;
 
+/* linux quotactl(2) compat */
+extern const struct quotactl_ops zpl_quotactl_operations;
+
 /* zpl_xattr.c */
 extern ssize_t zpl_xattr_list(struct dentry *dentry, char *buf, size_t size);
 extern int zpl_xattr_security_init(struct inode *ip, struct inode *dip,

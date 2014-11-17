@@ -28,7 +28,7 @@
 #include <sys/zfs_znode.h>
 #include <sys/zfs_ctldir.h>
 #include <sys/zpl.h>
-
+#include <linux/quota.h>
 
 static struct inode *
 zpl_inode_alloc(struct super_block *sb)
@@ -209,6 +209,8 @@ __zpl_show_options(struct seq_file *seq, zfs_sb_t *zsb)
 	}
 #endif /* CONFIG_FS_POSIX_ACL */
 
+	seq_puts(seq, ",usrquota,grpquota");
+
 	return (0);
 }
 
@@ -345,6 +347,45 @@ zpl_free_cached_objects(struct super_block *sb, int nr_to_scan)
 	/* noop */
 }
 #endif /* HAVE_FREE_CACHED_OBJECTS */
+
+static int zpl_fs_get_xstate(
+        struct super_block      *sb,
+        struct fs_quota_stat    *fqs)
+{
+	zfs_sb_t *zsb = sb->s_fs_info;
+    //return -ENOSYS;
+    memset(fqs, 0, sizeof(fs_quota_stat_t));
+    fqs->qs_version = FS_QSTAT_VERSION;
+    fqs->qs_pad = 0;
+    fqs->qs_uquota.qfs_ino=1111;
+
+    return 0;
+}
+
+static int zpl_fs_get_dqblk(
+        struct super_block      *sb,
+        int                     type,
+        qid_t                   id,
+        struct fs_disk_quota    *fdq)
+{
+/*        if (!XFS_IS_QUOTA_RUNNING(mp))
+                return -ENOSYS;
+        if (!XFS_IS_QUOTA_ON(mp))
+                return -ESRCH;
+*/      memset(fdq, 0, sizeof(*fdq));
+        fdq->d_version = FS_DQUOT_VERSION;
+        fdq->d_blk_hardlimit = 22222;
+        return 0;
+}
+
+//        .set_xstate             = zpl_fs_set_xstate,
+
+const struct quotactl_ops zpl_quotactl_operations = {
+        .get_xstate             = zpl_fs_get_xstate,
+        .set_xstate             = NULL,
+        .get_dqblk              = zpl_fs_get_dqblk,
+        .set_dqblk              = NULL,
+};
 
 const struct super_operations zpl_super_operations = {
 	.alloc_inode		= zpl_inode_alloc,

@@ -1253,6 +1253,7 @@ zfs_domount(struct super_block *sb, void *data, int silent)
 #ifdef HAVE_S_D_OP
 	sb->s_d_op = &zpl_dentry_operations;
 #endif /* HAVE_S_D_OP */
+    sb->s_qcop = &zpl_quotactl_operations;
 
 	/* Set features for file system. */
 	zfs_set_fuid_feature(zsb);
