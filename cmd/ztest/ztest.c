@@ -101,6 +101,7 @@
 #include <sys/zio.h>
 #include <sys/zil.h>
 #include <sys/zil_impl.h>
+#include <sys/zfs_rlock.h>
 #include <sys/vdev_impl.h>
 #include <sys/vdev_file.h>
 #include <sys/spa_impl.h>
@@ -122,8 +123,9 @@
 #include <ctype.h>
 #include <math.h>
 #include <sys/fs/zfs.h>
+#include <zfs_fletcher.h>
 #include <libnvpair.h>
-#ifdef __GNUC__
+#ifdef __GLIBC__
 #include <execinfo.h> /* for backtrace() */
 #endif
 
@@ -175,7 +177,7 @@ static const ztest_shared_opts_t ztest_opts_defaults = {
 	.zo_mirrors = 2,
 	.zo_raidz = 4,
 	.zo_raidz_parity = 1,
-	.zo_vdev_size = SPA_MINDEVSIZE,
+	.zo_vdev_size = SPA_MINDEVSIZE * 2,
 	.zo_datasets = 7,
 	.zo_threads = 23,
 	.zo_passtime = 60,		/* 60 seconds */
@@ -231,15 +233,6 @@ typedef struct bufwad {
 	uint64_t	bw_data;
 } bufwad_t;
 
-/*
- * XXX -- fix zfs range locks to be generic so we can use them here.
- */
-typedef enum {
-	RL_READER,
-	RL_WRITER,
-	RL_APPEND
-} rl_type_t;
-
 typedef struct rll {
 	void		*rll_writer;
 	int		rll_readers;
@@ -247,12 +240,10 @@ typedef struct rll {
 	kcondvar_t	rll_cv;
 } rll_t;
 
-typedef struct rl {
-	uint64_t	rl_object;
-	uint64_t	rl_offset;
-	uint64_t	rl_size;
-	rll_t		*rl_lock;
-} rl_t;
+typedef struct zll {
+	list_t z_list;
+	kmutex_t z_lock;
+} zll_t;
 
 #define	ZTEST_RANGE_LOCKS	64
 #define	ZTEST_OBJECT_LOCKS	64
@@ -284,7 +275,7 @@ typedef struct ztest_ds {
 	char		zd_name[MAXNAMELEN];
 	kmutex_t	zd_dirobj_lock;
 	rll_t		zd_object_lock[ZTEST_OBJECT_LOCKS];
-	rll_t		zd_range_lock[ZTEST_RANGE_LOCKS];
+	zll_t		zd_range_lock[ZTEST_RANGE_LOCKS];
 } ztest_ds_t;
 
 /*
@@ -337,6 +328,7 @@ ztest_func_t ztest_vdev_aux_add_remove;
 ztest_func_t ztest_split_pool;
 ztest_func_t ztest_reguid;
 ztest_func_t ztest_spa_upgrade;
+ztest_func_t ztest_fletcher;
 
 uint64_t zopt_always = 0ULL * NANOSEC;		/* all the time */
 uint64_t zopt_incessant = 1ULL * NANOSEC / 10;	/* every 1/10 second */
@@ -382,6 +374,7 @@ ztest_info_t ztest_info[] = {
 	ZTI_INIT(ztest_vdev_LUN_growth, 1, &zopt_rarely),
 	ZTI_INIT(ztest_vdev_add_remove, 1, &ztest_opts.zo_vdevtime),
 	ZTI_INIT(ztest_vdev_aux_add_remove, 1, &ztest_opts.zo_vdevtime),
+	ZTI_INIT(ztest_fletcher, 1, &zopt_rarely),
 };
 
 #define	ZTEST_FUNCS	(sizeof (ztest_info) / sizeof (ztest_info_t))
@@ -490,7 +483,7 @@ _umem_logging_init(void)
 static void sig_handler(int signo)
 {
 	struct sigaction action;
-#ifdef __GNUC__ /* backtrace() is a GNU extension */
+#ifdef __GLIBC__ /* backtrace() is a GNU extension */
 	int nptrs;
 	void *buffer[BACKTRACE_SZ];
 
@@ -827,9 +820,6 @@ ztest_kill(ztest_shared_t *zs)
 	spa_config_sync(ztest_spa, B_FALSE, B_FALSE);
 	mutex_exit(&spa_namespace_lock);
 
-	if (ztest_opts.zo_verbose >= 3)
-		zfs_dbgmsg_print(FTAG);
-
 	(void) kill(getpid(), SIGKILL);
 }
 
@@ -1136,6 +1126,100 @@ ztest_spa_prop_set_uint64(zpool_prop_t prop, uint64_t value)
 	return (error);
 }
 
+
+/*
+ * Object and range lock mechanics
+ */
+typedef struct {
+	list_node_t z_lnode;
+	refcount_t z_refcnt;
+	uint64_t z_object;
+	zfs_rlock_t z_range_lock;
+} ztest_znode_t;
+
+typedef struct {
+	rl_t *z_rl;
+	ztest_znode_t *z_ztznode;
+} ztest_zrl_t;
+
+static ztest_znode_t *
+ztest_znode_init(uint64_t object)
+{
+	ztest_znode_t *zp = umem_alloc(sizeof (*zp), UMEM_NOFAIL);
+
+	list_link_init(&zp->z_lnode);
+	refcount_create(&zp->z_refcnt);
+	zp->z_object = object;
+	zfs_rlock_init(&zp->z_range_lock);
+
+	return (zp);
+}
+
+static void
+ztest_znode_fini(ztest_znode_t *zp)
+{
+	ASSERT(refcount_is_zero(&zp->z_refcnt));
+	zfs_rlock_destroy(&zp->z_range_lock);
+	zp->z_object = 0;
+	refcount_destroy(&zp->z_refcnt);
+	list_link_init(&zp->z_lnode);
+	umem_free(zp, sizeof (*zp));
+}
+
+static void
+ztest_zll_init(zll_t *zll)
+{
+	mutex_init(&zll->z_lock, NULL, MUTEX_DEFAULT, NULL);
+	list_create(&zll->z_list, sizeof (ztest_znode_t),
+	    offsetof(ztest_znode_t, z_lnode));
+}
+
+static void
+ztest_zll_destroy(zll_t *zll)
+{
+	list_destroy(&zll->z_list);
+	mutex_destroy(&zll->z_lock);
+}
+
+#define	RL_TAG "range_lock"
+static ztest_znode_t *
+ztest_znode_get(ztest_ds_t *zd, uint64_t object)
+{
+	zll_t *zll = &zd->zd_range_lock[object & (ZTEST_OBJECT_LOCKS - 1)];
+	ztest_znode_t *zp = NULL;
+	mutex_enter(&zll->z_lock);
+	for (zp = list_head(&zll->z_list); (zp);
+	    zp = list_next(&zll->z_list, zp)) {
+		if (zp->z_object == object) {
+			refcount_add(&zp->z_refcnt, RL_TAG);
+			break;
+		}
+	}
+	if (zp == NULL) {
+		zp = ztest_znode_init(object);
+		refcount_add(&zp->z_refcnt, RL_TAG);
+		list_insert_head(&zll->z_list, zp);
+	}
+	mutex_exit(&zll->z_lock);
+	return (zp);
+}
+
+static void
+ztest_znode_put(ztest_ds_t *zd, ztest_znode_t *zp)
+{
+	zll_t *zll = NULL;
+	ASSERT3U(zp->z_object, !=, 0);
+	zll = &zd->zd_range_lock[zp->z_object & (ZTEST_OBJECT_LOCKS - 1)];
+	mutex_enter(&zll->z_lock);
+	refcount_remove(&zp->z_refcnt, RL_TAG);
+	if (refcount_is_zero(&zp->z_refcnt)) {
+		list_remove(&zll->z_list, zp);
+		ztest_znode_fini(zp);
+	}
+	mutex_exit(&zll->z_lock);
+}
+
+
 static void
 ztest_rll_init(rll_t *rll)
 {
@@ -1208,33 +1292,37 @@ ztest_object_unlock(ztest_ds_t *zd, uint64_t object)
 	ztest_rll_unlock(rll);
 }
 
-static rl_t *
-ztest_range_lock(ztest_ds_t *zd, uint64_t object, uint64_t offset,
-    uint64_t size, rl_type_t type)
+static ztest_zrl_t *
+ztest_zrl_init(rl_t *rl, ztest_znode_t *zp)
 {
-	uint64_t hash = object ^ (offset % (ZTEST_RANGE_LOCKS + 1));
-	rll_t *rll = &zd->zd_range_lock[hash & (ZTEST_RANGE_LOCKS - 1)];
-	rl_t *rl;
-
-	rl = umem_alloc(sizeof (*rl), UMEM_NOFAIL);
-	rl->rl_object = object;
-	rl->rl_offset = offset;
-	rl->rl_size = size;
-	rl->rl_lock = rll;
-
-	ztest_rll_lock(rll, type);
-
-	return (rl);
+	ztest_zrl_t *zrl = umem_alloc(sizeof (*zrl), UMEM_NOFAIL);
+	zrl->z_rl = rl;
+	zrl->z_ztznode = zp;
+	return (zrl);
 }
 
 static void
-ztest_range_unlock(rl_t *rl)
+ztest_zrl_fini(ztest_zrl_t *zrl)
 {
-	rll_t *rll = rl->rl_lock;
+	umem_free(zrl, sizeof (*zrl));
+}
 
-	ztest_rll_unlock(rll);
+static ztest_zrl_t *
+ztest_range_lock(ztest_ds_t *zd, uint64_t object, uint64_t offset,
+    uint64_t size, rl_type_t type)
+{
+	ztest_znode_t *zp = ztest_znode_get(zd, object);
+	rl_t *rl = zfs_range_lock(&zp->z_range_lock, offset,
+	    size, type);
+	return (ztest_zrl_init(rl, zp));
+}
 
-	umem_free(rl, sizeof (*rl));
+static void
+ztest_range_unlock(ztest_ds_t *zd, ztest_zrl_t *zrl)
+{
+	zfs_range_unlock(zrl->z_rl);
+	ztest_znode_put(zd, zrl->z_ztznode);
+	ztest_zrl_fini(zrl);
 }
 
 static void
@@ -1256,7 +1344,7 @@ ztest_zd_init(ztest_ds_t *zd, ztest_shared_ds_t *szd, objset_t *os)
 		ztest_rll_init(&zd->zd_object_lock[l]);
 
 	for (l = 0; l < ZTEST_RANGE_LOCKS; l++)
-		ztest_rll_init(&zd->zd_range_lock[l]);
+		ztest_zll_init(&zd->zd_range_lock[l]);
 }
 
 static void
@@ -1271,7 +1359,7 @@ ztest_zd_fini(ztest_ds_t *zd)
 		ztest_rll_destroy(&zd->zd_object_lock[l]);
 
 	for (l = 0; l < ZTEST_RANGE_LOCKS; l++)
-		ztest_rll_destroy(&zd->zd_range_lock[l]);
+		ztest_zll_destroy(&zd->zd_range_lock[l]);
 }
 
 #define	TXG_MIGHTWAIT	(ztest_random(10) == 0 ? TXG_NOWAIT : TXG_WAIT)
@@ -1628,7 +1716,7 @@ ztest_replay_write(ztest_ds_t *zd, lr_write_t *lr, boolean_t byteswap)
 	dmu_tx_t *tx;
 	dmu_buf_t *db;
 	arc_buf_t *abuf = NULL;
-	rl_t *rl;
+	ztest_zrl_t *rl;
 
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
@@ -1677,7 +1765,7 @@ ztest_replay_write(ztest_ds_t *zd, lr_write_t *lr, boolean_t byteswap)
 		if (abuf != NULL)
 			dmu_return_arcbuf(abuf);
 		dmu_buf_rele(db, FTAG);
-		ztest_range_unlock(rl);
+		ztest_range_unlock(zd, rl);
 		ztest_object_unlock(zd, lr->lr_foid);
 		return (ENOSPC);
 	}
@@ -1734,7 +1822,7 @@ ztest_replay_write(ztest_ds_t *zd, lr_write_t *lr, boolean_t byteswap)
 
 	dmu_tx_commit(tx);
 
-	ztest_range_unlock(rl);
+	ztest_range_unlock(zd, rl);
 	ztest_object_unlock(zd, lr->lr_foid);
 
 	return (0);
@@ -1746,7 +1834,7 @@ ztest_replay_truncate(ztest_ds_t *zd, lr_truncate_t *lr, boolean_t byteswap)
 	objset_t *os = zd->zd_os;
 	dmu_tx_t *tx;
 	uint64_t txg;
-	rl_t *rl;
+	ztest_zrl_t *rl;
 
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
@@ -1761,7 +1849,7 @@ ztest_replay_truncate(ztest_ds_t *zd, lr_truncate_t *lr, boolean_t byteswap)
 
 	txg = ztest_tx_assign(tx, TXG_WAIT, FTAG);
 	if (txg == 0) {
-		ztest_range_unlock(rl);
+		ztest_range_unlock(zd, rl);
 		ztest_object_unlock(zd, lr->lr_foid);
 		return (ENOSPC);
 	}
@@ -1773,7 +1861,7 @@ ztest_replay_truncate(ztest_ds_t *zd, lr_truncate_t *lr, boolean_t byteswap)
 
 	dmu_tx_commit(tx);
 
-	ztest_range_unlock(rl);
+	ztest_range_unlock(zd, rl);
 	ztest_object_unlock(zd, lr->lr_foid);
 
 	return (0);
@@ -1876,23 +1964,30 @@ zil_replay_func_t ztest_replay_vector[TX_MAX_TYPE] = {
 /*
  * ZIL get_data callbacks
  */
+typedef struct ztest_zgd_private {
+	ztest_ds_t *z_zd;
+	ztest_zrl_t *z_rl;
+	uint64_t z_object;
+} ztest_zgd_private_t;
 
 static void
 ztest_get_done(zgd_t *zgd, int error)
 {
-	ztest_ds_t *zd = zgd->zgd_private;
-	uint64_t object = zgd->zgd_rl->rl_object;
+	ztest_zgd_private_t *zzp = zgd->zgd_private;
+	ztest_ds_t *zd = zzp->z_zd;
+	uint64_t object = zzp->z_object;
 
 	if (zgd->zgd_db)
 		dmu_buf_rele(zgd->zgd_db, zgd);
 
-	ztest_range_unlock(zgd->zgd_rl);
+	ztest_range_unlock(zd, zzp->z_rl);
 	ztest_object_unlock(zd, object);
 
 	if (error == 0 && zgd->zgd_bp)
 		zil_add_block(zgd->zgd_zilog, zgd->zgd_bp);
 
 	umem_free(zgd, sizeof (*zgd));
+	umem_free(zzp, sizeof (*zzp));
 }
 
 static int
@@ -1910,6 +2005,7 @@ ztest_get_data(void *arg, lr_write_t *lr, char *buf, zio_t *zio)
 	dmu_buf_t *db;
 	zgd_t *zgd;
 	int error;
+	ztest_zgd_private_t *zgd_private;
 
 	ztest_object_lock(zd, object, RL_READER);
 	error = dmu_bonus_hold(os, object, FTAG, &db);
@@ -1932,10 +2028,13 @@ ztest_get_data(void *arg, lr_write_t *lr, char *buf, zio_t *zio)
 
 	zgd = umem_zalloc(sizeof (*zgd), UMEM_NOFAIL);
 	zgd->zgd_zilog = zd->zd_zilog;
-	zgd->zgd_private = zd;
+	zgd_private = umem_zalloc(sizeof (ztest_zgd_private_t), UMEM_NOFAIL);
+	zgd_private->z_zd = zd;
+	zgd_private->z_object = object;
+	zgd->zgd_private = zgd_private;
 
 	if (buf != NULL) {	/* immediate write */
-		zgd->zgd_rl = ztest_range_lock(zd, object, offset, size,
+		zgd_private->z_rl = ztest_range_lock(zd, object, offset, size,
 		    RL_READER);
 
 		error = dmu_read(os, object, offset, size, buf,
@@ -1950,7 +2049,7 @@ ztest_get_data(void *arg, lr_write_t *lr, char *buf, zio_t *zio)
 			offset = 0;
 		}
 
-		zgd->zgd_rl = ztest_range_lock(zd, object, offset, size,
+		zgd_private->z_rl = ztest_range_lock(zd, object, offset, size,
 		    RL_READER);
 
 		error = dmu_buf_hold(os, object, offset, zgd, &db,
@@ -2201,7 +2300,7 @@ ztest_prealloc(ztest_ds_t *zd, uint64_t object, uint64_t offset, uint64_t size)
 	objset_t *os = zd->zd_os;
 	dmu_tx_t *tx;
 	uint64_t txg;
-	rl_t *rl;
+	ztest_zrl_t *rl;
 
 	txg_wait_synced(dmu_objset_pool(os), 0);
 
@@ -2222,7 +2321,7 @@ ztest_prealloc(ztest_ds_t *zd, uint64_t object, uint64_t offset, uint64_t size)
 		(void) dmu_free_long_range(os, object, offset, size);
 	}
 
-	ztest_range_unlock(rl);
+	ztest_range_unlock(zd, rl);
 	ztest_object_unlock(zd, object);
 }
 
@@ -3731,7 +3830,8 @@ ztest_dmu_read_write(ztest_ds_t *zd, uint64_t id)
 	 */
 	n = ztest_random(regions) * stride + ztest_random(width);
 	s = 1 + ztest_random(2 * width - 1);
-	dmu_prefetch(os, bigobj, n * chunksize, s * chunksize);
+	dmu_prefetch(os, bigobj, 0, n * chunksize, s * chunksize,
+	    ZIO_PRIORITY_SYNC_READ);
 
 	/*
 	 * Pick a random index and compute the offsets into packobj and bigobj.
@@ -4974,7 +5074,7 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 	char *path0;
 	char *pathrand;
 	size_t fsize;
-	int bshift = SPA_OLD_MAXBLOCKSHIFT + 2;	/* don't scrog all labels */
+	int bshift = SPA_MAXBLOCKSHIFT + 2;	/* don't scrog all labels */
 	int iters = 1000;
 	int maxfaults;
 	int mirror_save;
@@ -5138,6 +5238,31 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 	fsize = lseek(fd, 0, SEEK_END);
 
 	while (--iters != 0) {
+		/*
+		 * The offset must be chosen carefully to ensure that
+		 * we do not inject a given logical block with errors
+		 * on two different leaf devices, because ZFS can not
+		 * tolerate that (if maxfaults==1).
+		 *
+		 * We divide each leaf into chunks of size
+		 * (# leaves * SPA_MAXBLOCKSIZE * 4).  Within each chunk
+		 * there is a series of ranges to which we can inject errors.
+		 * Each range can accept errors on only a single leaf vdev.
+		 * The error injection ranges are separated by ranges
+		 * which we will not inject errors on any device (DMZs).
+		 * Each DMZ must be large enough such that a single block
+		 * can not straddle it, so that a single block can not be
+		 * a target in two different injection ranges (on different
+		 * leaf vdevs).
+		 *
+		 * For example, with 3 leaves, each chunk looks like:
+		 *    0 to  32M: injection range for leaf 0
+		 *  32M to  64M: DMZ - no injection allowed
+		 *  64M to  96M: injection range for leaf 1
+		 *  96M to 128M: DMZ - no injection allowed
+		 * 128M to 160M: injection range for leaf 2
+		 * 160M to 192M: DMZ - no injection allowed
+		 */
 		offset = ztest_random(fsize / (leaves << bshift)) *
 		    (leaves << bshift) + (leaf << bshift) +
 		    (ztest_random(1ULL << (bshift - 1)) & -8ULL);
@@ -5374,6 +5499,82 @@ ztest_spa_rename(ztest_ds_t *zd, uint64_t id)
 	(void) rw_unlock(&ztest_name_lock);
 }
 
+void
+ztest_fletcher(ztest_ds_t *zd, uint64_t id)
+{
+	hrtime_t end = gethrtime() + NANOSEC;
+
+	while (gethrtime() <= end) {
+		int run_count = 100;
+		void *buf;
+		uint32_t size;
+		int *ptr;
+		int i;
+		zio_cksum_t zc_ref;
+		zio_cksum_t zc_ref_byteswap;
+
+		size = ztest_random_blocksize();
+		buf = umem_alloc(size, UMEM_NOFAIL);
+
+		for (i = 0, ptr = buf; i < size / sizeof (*ptr); i++, ptr++)
+			*ptr = ztest_random(UINT_MAX);
+
+		VERIFY0(fletcher_4_impl_set("scalar"));
+		fletcher_4_native(buf, size, &zc_ref);
+		fletcher_4_byteswap(buf, size, &zc_ref_byteswap);
+
+		VERIFY0(fletcher_4_impl_set("cycle"));
+		while (run_count-- > 0) {
+			zio_cksum_t zc;
+			zio_cksum_t zc_byteswap;
+
+			fletcher_4_byteswap(buf, size, &zc_byteswap);
+			fletcher_4_native(buf, size, &zc);
+
+			VERIFY0(bcmp(&zc, &zc_ref, sizeof (zc)));
+			VERIFY0(bcmp(&zc_byteswap, &zc_ref_byteswap,
+			    sizeof (zc_byteswap)));
+		}
+
+		umem_free(buf, size);
+	}
+}
+
+static int
+ztest_check_path(char *path)
+{
+	struct stat s;
+	/* return true on success */
+	return (!stat(path, &s));
+}
+
+static void
+ztest_get_zdb_bin(char *bin, int len)
+{
+	char *zdb_path;
+	/*
+	 * Try to use ZDB_PATH and in-tree zdb path. If not successful, just
+	 * let popen to search through PATH.
+	 */
+	if ((zdb_path = getenv("ZDB_PATH"))) {
+		strlcpy(bin, zdb_path, len); /* In env */
+		if (!ztest_check_path(bin)) {
+			ztest_dump_core = 0;
+			fatal(1, "invalid ZDB_PATH '%s'", bin);
+		}
+		return;
+	}
+
+	VERIFY(realpath(getexecname(), bin) != NULL);
+	if (strstr(bin, "/ztest/")) {
+		strstr(bin, "/ztest/")[0] = '\0'; /* In-tree */
+		strcat(bin, "/zdb/zdb");
+		if (ztest_check_path(bin))
+			return;
+	}
+	strcpy(bin, "zdb");
+}
+
 /*
  * Verify pool integrity by running zdb.
  */
@@ -5384,21 +5585,14 @@ ztest_run_zdb(char *pool)
 	char *bin;
 	char *zdb;
 	char *zbuf;
+	const int len = MAXPATHLEN + MAXNAMELEN + 20;
 	FILE *fp;
 
-	bin = umem_alloc(MAXPATHLEN + MAXNAMELEN + 20, UMEM_NOFAIL);
-	zdb = umem_alloc(MAXPATHLEN + MAXNAMELEN + 20, UMEM_NOFAIL);
+	bin = umem_alloc(len, UMEM_NOFAIL);
+	zdb = umem_alloc(len, UMEM_NOFAIL);
 	zbuf = umem_alloc(1024, UMEM_NOFAIL);
 
-	VERIFY(realpath(getexecname(), bin) != NULL);
-	if (strncmp(bin, "/usr/sbin/ztest", 15) == 0) {
-		strcpy(bin, "/usr/sbin/zdb"); /* Installed */
-	} else if (strncmp(bin, "/sbin/ztest", 11) == 0) {
-		strcpy(bin, "/sbin/zdb"); /* Installed */
-	} else {
-		strstr(bin, "/ztest/")[0] = '\0'; /* In-tree */
-		strcat(bin, "/zdb/zdb");
-	}
+	ztest_get_zdb_bin(bin, len);
 
 	(void) sprintf(zdb,
 	    "%s -bcc%s%s -d -U %s %s",
@@ -5428,8 +5622,8 @@ ztest_run_zdb(char *pool)
 	else
 		fatal(0, "'%s' died with signal %d", zdb, WTERMSIG(status));
 out:
-	umem_free(bin, MAXPATHLEN + MAXNAMELEN + 20);
-	umem_free(zdb, MAXPATHLEN + MAXNAMELEN + 20);
+	umem_free(bin, len);
+	umem_free(zdb, len);
 	umem_free(zbuf, 1024);
 }
 
@@ -5894,9 +6088,6 @@ ztest_run(ztest_shared_t *zs)
 	zs->zs_alloc = metaslab_class_get_alloc(spa_normal_class(spa));
 	zs->zs_space = metaslab_class_get_space(spa_normal_class(spa));
 
-	if (ztest_opts.zo_verbose >= 3)
-		zfs_dbgmsg_print(FTAG);
-
 	umem_free(tid, ztest_opts.zo_threads * sizeof (kt_did_t));
 
 	/* Kill the resume thread */
@@ -5908,8 +6099,10 @@ ztest_run(ztest_shared_t *zs)
 	 * Right before closing the pool, kick off a bunch of async I/O;
 	 * spa_close() should wait for it to complete.
 	 */
-	for (object = 1; object < 50; object++)
-		dmu_prefetch(spa->spa_meta_objset, object, 0, 1ULL << 20);
+	for (object = 1; object < 50; object++) {
+		dmu_prefetch(spa->spa_meta_objset, object, 0, 0, 1ULL << 20,
+		    ZIO_PRIORITY_SYNC_READ);
+	}
 
 	/* Verify that at least one commit cb was called in a timely fashion */
 	if (zc_cb_counter >= ZTEST_COMMIT_CB_MIN_REG)
@@ -6163,7 +6356,7 @@ setup_hdr(void)
 
 	hdr = (void *)mmap(0, P2ROUNDUP(sizeof (*hdr), getpagesize()),
 	    PROT_READ | PROT_WRITE, MAP_SHARED, ztest_fd_data, 0);
-	VERIFY3P(hdr, !=, MAP_FAILED);
+	ASSERT(hdr != MAP_FAILED);
 
 	VERIFY3U(0, ==, ftruncate(ztest_fd_data, sizeof (ztest_shared_hdr_t)));
 
@@ -6190,14 +6383,14 @@ setup_data(void)
 
 	hdr = (void *)mmap(0, P2ROUNDUP(sizeof (*hdr), getpagesize()),
 	    PROT_READ, MAP_SHARED, ztest_fd_data, 0);
-	VERIFY3P(hdr, !=, MAP_FAILED);
+	ASSERT(hdr != MAP_FAILED);
 
 	size = shared_data_size(hdr);
 
 	(void) munmap((caddr_t)hdr, P2ROUNDUP(sizeof (*hdr), getpagesize()));
 	hdr = ztest_shared_hdr = (void *)mmap(0, P2ROUNDUP(size, getpagesize()),
 	    PROT_READ | PROT_WRITE, MAP_SHARED, ztest_fd_data, 0);
-	VERIFY3P(hdr, !=, MAP_FAILED);
+	ASSERT(hdr != MAP_FAILED);
 	buf = (uint8_t *)hdr;
 
 	offset = hdr->zh_hdr_size;

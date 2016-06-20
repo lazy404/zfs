@@ -25,7 +25,7 @@
 /*
  * Copyright 2011 Nexenta Systems, Inc. All rights reserved.
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
- * Copyright (c) 2012, 2014 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
  */
 
 #ifndef _SYS_ZFS_CONTEXT_H
@@ -160,8 +160,18 @@ extern int aok;
 
 /*
  * DTrace SDT probes have different signatures in userland than they do in
- * kernel.  If they're being used in kernel code, re-define them out of
+ * the kernel.  If they're being used in kernel code, re-define them out of
  * existence for their counterparts in libzpool.
+ *
+ * Here's an example of how to use the set-error probes in userland:
+ * zfs$target:::set-error /arg0 == EBUSY/ {stack();}
+ *
+ * Here's an example of how to use DTRACE_PROBE probes in userland:
+ * If there is a probe declared as follows:
+ * DTRACE_PROBE2(zfs__probe_name, uint64_t, blkid, dnode_t *, dn);
+ * Then you can use it as follows:
+ * zfs$target:::probe2 /copyinstr(arg0) == "zfs__probe_name"/
+ *     {printf("%u %p\n", arg1, arg2);}
  */
 
 #ifdef DTRACE_PROBE
@@ -212,7 +222,7 @@ extern int aok;
  */
 #define	TS_MAGIC		0x72f158ab4261e538ull
 #define	TS_RUN			0x00000002
-#define	TS_STACK_MIN		PTHREAD_STACK_MIN
+#define	TS_STACK_MIN		MAX(PTHREAD_STACK_MIN, 32768)
 #define	TS_STACK_MAX		(256 * 1024)
 
 /* in libzpool, p0 exists only to have its address taken */
@@ -274,6 +284,7 @@ typedef struct kmutex {
 } kmutex_t;
 
 #define	MUTEX_DEFAULT	0
+#define	MUTEX_NOLOCKDEP	MUTEX_DEFAULT
 #define	MUTEX_HELD(m)	((m)->m_owner == curthread)
 #define	MUTEX_NOT_HELD(m) (!MUTEX_HELD(m))
 
@@ -305,6 +316,7 @@ typedef int krw_t;
 #define	RW_READER	0
 #define	RW_WRITER	1
 #define	RW_DEFAULT	RW_READER
+#define	RW_NOLOCKDEP	RW_READER
 
 #define	RW_READ_HELD(x)		((x)->rw_readers > 0)
 #define	RW_WRITE_HELD(x)	((x)->rw_wr_owner == curthread)
@@ -341,6 +353,7 @@ typedef struct kcondvar {
 } kcondvar_t;
 
 #define	CV_DEFAULT	0
+#define	CALLOUT_FLAG_ABSOLUTE	0x2
 
 extern void cv_init(kcondvar_t *cv, char *name, int type, void *arg);
 extern void cv_destroy(kcondvar_t *cv);
@@ -353,6 +366,8 @@ extern void cv_broadcast(kcondvar_t *cv);
 #define	cv_timedwait_sig(cv, mp, at)		cv_timedwait(cv, mp, at)
 #define	cv_wait_sig(cv, mp)			cv_wait(cv, mp)
 #define	cv_wait_io(cv, mp)			cv_wait(cv, mp)
+#define	cv_timedwait_sig_hires(cv, mp, t, r, f) \
+	cv_timedwait_hires(cv, mp, t, r, f)
 
 /*
  * Thread-specific data
@@ -488,8 +503,10 @@ typedef struct vnode {
 	uint64_t	v_size;
 	int		v_fd;
 	char		*v_path;
+	int		v_dump_fd;
 } vnode_t;
 
+extern char *vn_dumpdir;
 #define	AV_SCANSTAMP_SZ	32		/* length of anti-virus scanstamp */
 
 typedef struct xoptattr {
@@ -623,7 +640,7 @@ extern void delay(clock_t ticks);
 #define	maxclsyspri	-20
 #define	defclsyspri	0
 
-#define	CPU_SEQID	(pthread_self() & (max_ncpus - 1))
+#define	CPU_SEQID	((uintptr_t)pthread_self() & (max_ncpus - 1))
 
 #define	kcred		NULL
 #define	CRED()		NULL
@@ -633,11 +650,14 @@ extern void delay(clock_t ticks);
 extern uint64_t physmem;
 
 extern int highbit64(uint64_t i);
+extern int lowbit64(uint64_t i);
 extern int random_get_bytes(uint8_t *ptr, size_t len);
 extern int random_get_pseudo_bytes(uint8_t *ptr, size_t len);
 
 extern void kernel_init(int);
 extern void kernel_fini(void);
+extern void thread_init(void);
+extern void thread_fini(void);
 
 struct spa;
 extern void nicenum(uint64_t num, char *buf);
@@ -718,6 +738,7 @@ extern int zfs_secpolicy_snapshot_perms(const char *name, cred_t *cr);
 extern int zfs_secpolicy_rename_perms(const char *from, const char *to,
     cred_t *cr);
 extern int zfs_secpolicy_destroy_perms(const char *name, cred_t *cr);
+extern int secpolicy_zfs(const cred_t *cr);
 extern zoneid_t getzoneid(void);
 
 /* SID stuff */

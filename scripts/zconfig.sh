@@ -63,6 +63,17 @@ fi
 # Initialize the test suite
 init
 
+# Disable the udev rule 90-zfs.rules to prevent the zfs module
+# stack from being loaded due to the detection of a zfs device.
+# This is important because this test scripts require full control
+# over when and how the modules are loaded/unloaded.  A trap is
+# set to ensure the udev rule is correctly replaced on exit.
+RULE=${udevruledir}/90-zfs.rules
+if test -e  ${RULE}; then
+	trap "mv ${RULE}.disabled ${RULE}" INT TERM EXIT
+	mv ${RULE} ${RULE}.disabled
+fi
+
 # Perform pre-cleanup is requested
 if [ ${CLEANUP} ]; then
 	${ZFS_SH} -u
@@ -217,15 +228,26 @@ test_3() {
 	zconfig_zvol_device_stat 10 ${POOL_NAME} ${FULL_ZVOL_NAME} \
 	    ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 11
 
+	# Toggle the snapdev and observe snapshot device links toggled
+	${ZFS} set snapdev=hidden ${FULL_ZVOL_NAME} || fail 12
+	
+	zconfig_zvol_device_stat 7 ${POOL_NAME} ${FULL_ZVOL_NAME} \
+	    "invalid" ${FULL_CLONE_NAME} || fail 13
+
+	${ZFS} set snapdev=visible ${FULL_ZVOL_NAME} || fail 14
+
+	zconfig_zvol_device_stat 10 ${POOL_NAME} ${FULL_ZVOL_NAME} \
+	    ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 15
+
 	# Destroy the pool and consequently the devices
-	${ZPOOL_CREATE_SH} -p ${POOL_NAME} -c lo-raidz2 -d || fail 12
+	${ZPOOL_CREATE_SH} -p ${POOL_NAME} -c lo-raidz2 -d || fail 16
 
 	# verify the devices were removed
 	zconfig_zvol_device_stat 0 ${POOL_NAME} ${FULL_ZVOL_NAME} \
-	    ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 13
+	    ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 17
 
-	${ZFS_SH} -u || fail 14
-	rm -f ${TMP_CACHE} || fail 15
+	${ZFS_SH} -u || fail 18
+	rm -f ${TMP_CACHE} || fail 19
 
 	pass
 }

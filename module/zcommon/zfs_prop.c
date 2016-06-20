@@ -35,6 +35,7 @@
 
 #include "zfs_prop.h"
 #include "zfs_deleg.h"
+#include "zfs_fletcher.h"
 
 #if defined(_KERNEL)
 #include <sys/systm.h>
@@ -452,6 +453,8 @@ zfs_prop_init(void)
 	    PROP_READONLY, ZFS_TYPE_DATASET, "OBJSETID");
 	zprop_register_hidden(ZFS_PROP_INCONSISTENT, "inconsistent",
 	    PROP_TYPE_NUMBER, PROP_READONLY, ZFS_TYPE_DATASET, "INCONSISTENT");
+	zprop_register_hidden(ZFS_PROP_PREV_SNAP, "prevsnap", PROP_TYPE_STRING,
+	    PROP_READONLY, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME, "PREVSNAP");
 
 	/*
 	 * Property to be removed once libbe is integrated
@@ -693,12 +696,14 @@ zfs_prop_align_right(zfs_prop_t prop)
 static int __init
 zcommon_init(void)
 {
+	fletcher_4_init();
 	return (0);
 }
 
 static void __exit
 zcommon_fini(void)
 {
+	fletcher_4_fini();
 }
 
 module_init(zcommon_init);

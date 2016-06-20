@@ -446,6 +446,7 @@ typedef struct arc_stats {
 	kstat_named_t arcstat_l2_writes_done;
 	kstat_named_t arcstat_l2_writes_error;
 	kstat_named_t arcstat_l2_writes_lock_retry;
+	kstat_named_t arcstat_l2_writes_skip_toobig;
 	kstat_named_t arcstat_l2_evict_lock_retry;
 	kstat_named_t arcstat_l2_evict_reading;
 	kstat_named_t arcstat_l2_evict_l1cached;
@@ -474,6 +475,8 @@ typedef struct arc_stats {
 	kstat_named_t arcstat_meta_limit;
 	kstat_named_t arcstat_meta_max;
 	kstat_named_t arcstat_meta_min;
+	kstat_named_t arcstat_sync_wait_for_async;
+	kstat_named_t arcstat_demand_hit_predictive_prefetch;
 	kstat_named_t arcstat_need_free;
 	kstat_named_t arcstat_sys_free;
 } arc_stats_t;
@@ -540,6 +543,7 @@ static arc_stats_t arc_stats = {
 	{ "l2_writes_done",		KSTAT_DATA_UINT64 },
 	{ "l2_writes_error",		KSTAT_DATA_UINT64 },
 	{ "l2_writes_lock_retry",	KSTAT_DATA_UINT64 },
+	{ "l2_writes_skip_toobig",	KSTAT_DATA_UINT64 },
 	{ "l2_evict_lock_retry",	KSTAT_DATA_UINT64 },
 	{ "l2_evict_reading",		KSTAT_DATA_UINT64 },
 	{ "l2_evict_l1cached",		KSTAT_DATA_UINT64 },
@@ -568,6 +572,8 @@ static arc_stats_t arc_stats = {
 	{ "arc_meta_limit",		KSTAT_DATA_UINT64 },
 	{ "arc_meta_max",		KSTAT_DATA_UINT64 },
 	{ "arc_meta_min",		KSTAT_DATA_UINT64 },
+	{ "sync_wait_for_async",	KSTAT_DATA_UINT64 },
+	{ "demand_hit_predictive_prefetch", KSTAT_DATA_UINT64 },
 	{ "arc_need_free",		KSTAT_DATA_UINT64 },
 	{ "arc_sys_free",		KSTAT_DATA_UINT64 }
 };
@@ -677,15 +683,6 @@ static arc_buf_hdr_t arc_eviction_hdr;
 #define	HDR_HAS_L1HDR(hdr)	((hdr)->b_flags & ARC_FLAG_HAS_L1HDR)
 #define	HDR_HAS_L2HDR(hdr)	((hdr)->b_flags & ARC_FLAG_HAS_L2HDR)
 
-/* For storing compression mode in b_flags */
-#define	HDR_COMPRESS_OFFSET	24
-#define	HDR_COMPRESS_NBITS	7
-
-#define	HDR_GET_COMPRESS(hdr)	((enum zio_compress)BF32_GET(hdr->b_flags, \
-	    HDR_COMPRESS_OFFSET, HDR_COMPRESS_NBITS))
-#define	HDR_SET_COMPRESS(hdr, cmp) BF32_SET(hdr->b_flags, \
-	    HDR_COMPRESS_OFFSET, HDR_COMPRESS_NBITS, (cmp))
-
 /*
  * Other sizes
  */
@@ -731,6 +728,8 @@ uint64_t zfs_crc64_table[256];
 
 #define	L2ARC_WRITE_SIZE	(8 * 1024 * 1024)	/* initial write max */
 #define	L2ARC_HEADROOM		2			/* num of writes */
+#define	L2ARC_MAX_BLOCK_SIZE	(16 * 1024 * 1024)	/* max compress size */
+
 /*
  * If we discover during ARC scan any buffers to be compressed, we boost
  * our headroom for the next scanning cycle by this percentage multiple.
@@ -738,6 +737,7 @@ uint64_t zfs_crc64_table[256];
 #define	L2ARC_HEADROOM_BOOST	200
 #define	L2ARC_FEED_SECS		1		/* caching interval secs */
 #define	L2ARC_FEED_MIN_MS	200		/* min caching interval ms */
+
 
 /*
  * Used to distinguish headers that are being process by
@@ -757,6 +757,7 @@ unsigned long l2arc_write_max = L2ARC_WRITE_SIZE;	/* def max write size */
 unsigned long l2arc_write_boost = L2ARC_WRITE_SIZE;	/* extra warmup write */
 unsigned long l2arc_headroom = L2ARC_HEADROOM;		/* # of dev writes */
 unsigned long l2arc_headroom_boost = L2ARC_HEADROOM_BOOST;
+unsigned long l2arc_max_block_size = L2ARC_MAX_BLOCK_SIZE;
 unsigned long l2arc_feed_secs = L2ARC_FEED_SECS;	/* interval seconds */
 unsigned long l2arc_feed_min_ms = L2ARC_FEED_MIN_MS;	/* min interval msecs */
 int l2arc_noprefetch = B_TRUE;			/* don't cache prefetch bufs */
@@ -1483,7 +1484,7 @@ arc_buf_info(arc_buf_t *ab, arc_buf_info_t *abi, int state_index)
 	if (l2hdr) {
 		abi->abi_l2arc_dattr = l2hdr->b_daddr;
 		abi->abi_l2arc_asize = l2hdr->b_asize;
-		abi->abi_l2arc_compress = HDR_GET_COMPRESS(hdr);
+		abi->abi_l2arc_compress = l2hdr->b_compress;
 		abi->abi_l2arc_hits = l2hdr->b_hits;
 	}
 
@@ -1954,7 +1955,7 @@ arc_buf_l2_cdata_free(arc_buf_hdr_t *hdr)
 	 * separately compressed buffer, so there's nothing to free (it
 	 * points to the same buffer as the arc_buf_t's b_data field).
 	 */
-	if (HDR_GET_COMPRESS(hdr) == ZIO_COMPRESS_OFF) {
+	if (hdr->b_l2hdr.b_compress == ZIO_COMPRESS_OFF) {
 		hdr->b_l1hdr.b_tmp_cdata = NULL;
 		return;
 	}
@@ -1963,12 +1964,12 @@ arc_buf_l2_cdata_free(arc_buf_hdr_t *hdr)
 	 * There's nothing to free since the buffer was all zero's and
 	 * compressed to a zero length buffer.
 	 */
-	if (HDR_GET_COMPRESS(hdr) == ZIO_COMPRESS_EMPTY) {
+	if (hdr->b_l2hdr.b_compress == ZIO_COMPRESS_EMPTY) {
 		ASSERT3P(hdr->b_l1hdr.b_tmp_cdata, ==, NULL);
 		return;
 	}
 
-	ASSERT(L2ARC_IS_VALID_COMPRESS(HDR_GET_COMPRESS(hdr)));
+	ASSERT(L2ARC_IS_VALID_COMPRESS(hdr->b_l2hdr.b_compress));
 
 	arc_buf_free_on_write(hdr->b_l1hdr.b_tmp_cdata,
 	    hdr->b_size, zio_data_buf_free);
@@ -2694,8 +2695,8 @@ arc_flush_state(arc_state_t *state, uint64_t spa, arc_buf_contents_t type,
 }
 
 /*
- * Helper function for arc_prune() it is responsible for safely handling
- * the execution of a registered arc_prune_func_t.
+ * Helper function for arc_prune_async() it is responsible for safely
+ * handling the execution of a registered arc_prune_func_t.
  */
 static void
 arc_prune_task(void *ptr)
@@ -2706,12 +2707,7 @@ arc_prune_task(void *ptr)
 	if (func != NULL)
 		func(ap->p_adjust, ap->p_private);
 
-	/* Callback unregistered concurrently with execution */
-	if (refcount_remove(&ap->p_refcnt, func) == 0) {
-		ASSERT(!list_link_active(&ap->p_node));
-		refcount_destroy(&ap->p_refcnt);
-		kmem_free(ap, sizeof (*ap));
-	}
+	refcount_remove(&ap->p_refcnt, func);
 }
 
 /*
@@ -2720,7 +2716,7 @@ arc_prune_task(void *ptr)
  * honor the arc_meta_limit and reclaim otherwise pinned ARC buffers.  This
  * is analogous to dnlc_reduce_cache() but more generic.
  *
- * This operation is performed asyncronously so it may be safely called
+ * This operation is performed asynchronously so it may be safely called
  * in the context of the arc_reclaim_thread().  A reference is taken here
  * for each registered arc_prune_t and the arc_prune_task() is responsible
  * for releasing it once the registered arc_prune_func_t has completed.
@@ -2743,13 +2739,6 @@ arc_prune_async(int64_t adjust)
 		ARCSTAT_BUMP(arcstat_prune);
 	}
 	mutex_exit(&arc_prune_mtx);
-}
-
-static void
-arc_prune(int64_t adjust)
-{
-	arc_prune_async(adjust);
-	taskq_wait_outstanding(arc_prune_taskq, 0);
 }
 
 /*
@@ -3195,13 +3184,10 @@ arc_flush(spa_t *spa, boolean_t retry)
 void
 arc_shrink(int64_t to_free)
 {
-	if (arc_c > arc_c_min) {
+	uint64_t c = arc_c;
 
-		if (arc_c > arc_c_min + to_free)
-			atomic_add_64(&arc_c, -to_free);
-		else
-			arc_c = arc_c_min;
-
+	if (c > to_free && c - to_free > arc_c_min) {
+		arc_c = c - to_free;
 		atomic_add_64(&arc_p, -(arc_p >> arc_shrink_shift));
 		if (arc_c > arc_size)
 			arc_c = MAX(arc_size, arc_c_min);
@@ -3209,6 +3195,8 @@ arc_shrink(int64_t to_free)
 			arc_p = (arc_c >> 1);
 		ASSERT(arc_c >= arc_c_min);
 		ASSERT((int64_t)arc_p >= 0);
+	} else {
+		arc_c = arc_c_min;
 	}
 
 	if (arc_size > arc_c)
@@ -3385,10 +3373,15 @@ arc_kmem_reap_now(void)
 		 * We are exceeding our meta-data cache limit.
 		 * Prune some entries to release holds on meta-data.
 		 */
-		arc_prune(zfs_arc_meta_prune);
+		arc_prune_async(zfs_arc_meta_prune);
 	}
 
 	for (i = 0; i < SPA_MAXBLOCKSIZE >> SPA_MINBLOCKSHIFT; i++) {
+#ifdef _ILP32
+		/* reach upper limit of cache size on 32-bit */
+		if (zio_buf_cache[i] == NULL)
+			break;
+#endif
 		if (zio_buf_cache[i] != prev_cache) {
 			prev_cache = zio_buf_cache[i];
 			kmem_cache_reap_now(zio_buf_cache[i]);
@@ -3432,7 +3425,7 @@ static void
 arc_reclaim_thread(void)
 {
 	fstrans_cookie_t	cookie = spl_fstrans_mark();
-	clock_t			growtime = 0;
+	hrtime_t		growtime = 0;
 	callb_cpr_t		cpr;
 
 	CALLB_CPR_INIT(&cpr, &arc_reclaim_lock, callb_generic_cpr, FTAG);
@@ -3456,7 +3449,7 @@ arc_reclaim_thread(void)
 			 * Wait at least zfs_grow_retry (default 5) seconds
 			 * before considering growing.
 			 */
-			growtime = ddi_get_lbolt() + (arc_grow_retry * hz);
+			growtime = gethrtime() + SEC2NSEC(arc_grow_retry);
 
 			arc_kmem_reap_now();
 
@@ -3475,7 +3468,7 @@ arc_reclaim_thread(void)
 			}
 		} else if (free_memory < arc_c >> arc_no_grow_shift) {
 			arc_no_grow = B_TRUE;
-		} else if (ddi_get_lbolt() >= growtime) {
+		} else if (gethrtime() >= growtime) {
 			arc_no_grow = B_FALSE;
 		}
 
@@ -3508,8 +3501,8 @@ arc_reclaim_thread(void)
 			 * even if we aren't being signalled)
 			 */
 			CALLB_CPR_SAFE_BEGIN(&cpr);
-			(void) cv_timedwait_sig(&arc_reclaim_thread_cv,
-			    &arc_reclaim_lock, ddi_get_lbolt() + hz);
+			(void) cv_timedwait_sig_hires(&arc_reclaim_thread_cv,
+			    &arc_reclaim_lock, SEC2NSEC(1), MSEC2NSEC(1), 0);
 			CALLB_CPR_SAFE_END(&cpr, &arc_reclaim_lock);
 		}
 	}
@@ -3773,7 +3766,7 @@ arc_adapt(int bytes, arc_state_t *state)
 	 * If we're within (2 * maxblocksize) bytes of the target
 	 * cache size, increment the target cache size
 	 */
-	VERIFY3U(arc_c, >=, 2ULL << SPA_MAXBLOCKSHIFT);
+	ASSERT3U(arc_c, >=, 2ULL << SPA_MAXBLOCKSHIFT);
 	if (arc_size >= arc_c - (2ULL << SPA_MAXBLOCKSHIFT)) {
 		atomic_add_64(&arc_c, (int64_t)bytes);
 		if (arc_c > arc_c_max)
@@ -4254,6 +4247,36 @@ top:
 
 		if (HDR_IO_IN_PROGRESS(hdr)) {
 
+			if ((hdr->b_flags & ARC_FLAG_PRIO_ASYNC_READ) &&
+			    priority == ZIO_PRIORITY_SYNC_READ) {
+				/*
+				 * This sync read must wait for an
+				 * in-progress async read (e.g. a predictive
+				 * prefetch).  Async reads are queued
+				 * separately at the vdev_queue layer, so
+				 * this is a form of priority inversion.
+				 * Ideally, we would "inherit" the demand
+				 * i/o's priority by moving the i/o from
+				 * the async queue to the synchronous queue,
+				 * but there is currently no mechanism to do
+				 * so.  Track this so that we can evaluate
+				 * the magnitude of this potential performance
+				 * problem.
+				 *
+				 * Note that if the prefetch i/o is already
+				 * active (has been issued to the device),
+				 * the prefetch improved performance, because
+				 * we issued it sooner than we would have
+				 * without the prefetch.
+				 */
+				DTRACE_PROBE1(arc__sync__wait__for__async,
+				    arc_buf_hdr_t *, hdr);
+				ARCSTAT_BUMP(arcstat_sync_wait_for_async);
+			}
+			if (hdr->b_flags & ARC_FLAG_PREDICTIVE_PREFETCH) {
+				hdr->b_flags &= ~ARC_FLAG_PREDICTIVE_PREFETCH;
+			}
+
 			if (*arc_flags & ARC_FLAG_WAIT) {
 				cv_wait(&hdr->b_l1hdr.b_cv, hash_lock);
 				mutex_exit(hash_lock);
@@ -4262,7 +4285,7 @@ top:
 			ASSERT(*arc_flags & ARC_FLAG_NOWAIT);
 
 			if (done) {
-				arc_callback_t	*acb = NULL;
+				arc_callback_t *acb = NULL;
 
 				acb = kmem_zalloc(sizeof (arc_callback_t),
 				    KM_SLEEP);
@@ -4287,6 +4310,19 @@ top:
 		    hdr->b_l1hdr.b_state == arc_mfu);
 
 		if (done) {
+			if (hdr->b_flags & ARC_FLAG_PREDICTIVE_PREFETCH) {
+				/*
+				 * This is a demand read which does not have to
+				 * wait for i/o because we did a predictive
+				 * prefetch i/o for it, which has completed.
+				 */
+				DTRACE_PROBE1(
+				    arc__demand__hit__predictive__prefetch,
+				    arc_buf_hdr_t *, hdr);
+				ARCSTAT_BUMP(
+				    arcstat_demand_hit_predictive_prefetch);
+				hdr->b_flags &= ~ARC_FLAG_PREDICTIVE_PREFETCH;
+			}
 			add_reference(hdr, hash_lock, private);
 			/*
 			 * If this block is already in use, create a new
@@ -4332,17 +4368,11 @@ top:
 
 		/*
 		 * Gracefully handle a damaged logical block size as a
-		 * checksum error by passing a dummy zio to the done callback.
+		 * checksum error.
 		 */
 		if (size > spa_maxblocksize(spa)) {
-			if (done) {
-				rzio = zio_null(pio, spa, NULL,
-				    NULL, NULL, zio_flags);
-				rzio->io_error = ECKSUM;
-				done(rzio, buf, private);
-				zio_nowait(rzio);
-			}
-			rc = ECKSUM;
+			ASSERT3P(buf, ==, NULL);
+			rc = SET_ERROR(ECKSUM);
 			goto out;
 		}
 
@@ -4365,12 +4395,16 @@ top:
 				goto top; /* restart the IO request */
 			}
 
-			/* if this is a prefetch, we don't have a reference */
-			if (*arc_flags & ARC_FLAG_PREFETCH) {
+			/*
+			 * If there is a callback, we pass our reference to
+			 * it; otherwise we remove our reference.
+			 */
+			if (done == NULL) {
 				(void) remove_reference(hdr, hash_lock,
 				    private);
-				hdr->b_flags |= ARC_FLAG_PREFETCH;
 			}
+			if (*arc_flags & ARC_FLAG_PREFETCH)
+				hdr->b_flags |= ARC_FLAG_PREFETCH;
 			if (*arc_flags & ARC_FLAG_L2CACHE)
 				hdr->b_flags |= ARC_FLAG_L2CACHE;
 			if (*arc_flags & ARC_FLAG_L2COMPRESS)
@@ -4393,11 +4427,13 @@ top:
 			ASSERT(refcount_is_zero(&hdr->b_l1hdr.b_refcnt));
 			ASSERT3P(hdr->b_l1hdr.b_buf, ==, NULL);
 
-			/* if this is a prefetch, we don't have a reference */
+			/*
+			 * If there is a callback, we pass a reference to it.
+			 */
+			if (done != NULL)
+				add_reference(hdr, hash_lock, private);
 			if (*arc_flags & ARC_FLAG_PREFETCH)
 				hdr->b_flags |= ARC_FLAG_PREFETCH;
-			else
-				add_reference(hdr, hash_lock, private);
 			if (*arc_flags & ARC_FLAG_L2CACHE)
 				hdr->b_flags |= ARC_FLAG_L2CACHE;
 			if (*arc_flags & ARC_FLAG_L2COMPRESS)
@@ -4415,6 +4451,8 @@ top:
 			arc_access(hdr, hash_lock);
 		}
 
+		if (*arc_flags & ARC_FLAG_PREDICTIVE_PREFETCH)
+			hdr->b_flags |= ARC_FLAG_PREDICTIVE_PREFETCH;
 		ASSERT(!GHOST_STATE(hdr->b_l1hdr.b_state));
 
 		acb = kmem_zalloc(sizeof (arc_callback_t), KM_SLEEP);
@@ -4429,7 +4467,7 @@ top:
 		    (vd = hdr->b_l2hdr.b_dev->l2ad_vdev) != NULL) {
 			devw = hdr->b_l2hdr.b_dev->l2ad_writing;
 			addr = hdr->b_l2hdr.b_daddr;
-			b_compress = HDR_GET_COMPRESS(hdr);
+			b_compress = hdr->b_l2hdr.b_compress;
 			b_asize = hdr->b_l2hdr.b_asize;
 			/*
 			 * Lock out device removal.
@@ -4453,6 +4491,11 @@ top:
 		ARCSTAT_CONDSTAT(!HDR_PREFETCH(hdr),
 		    demand, prefetch, !HDR_ISTYPE_METADATA(hdr),
 		    data, metadata, misses);
+
+		if (priority == ZIO_PRIORITY_ASYNC_READ)
+			hdr->b_flags |= ARC_FLAG_PRIO_ASYNC_READ;
+		else
+			hdr->b_flags &= ~ARC_FLAG_PRIO_ASYNC_READ;
 
 		if (vd != NULL && l2arc_ndev != 0 && !(l2arc_norw && devw)) {
 			/*
@@ -4580,13 +4623,19 @@ arc_add_prune_callback(arc_prune_func_t *func, void *private)
 void
 arc_remove_prune_callback(arc_prune_t *p)
 {
+	boolean_t wait = B_FALSE;
 	mutex_enter(&arc_prune_mtx);
 	list_remove(&arc_prune_list, p);
-	if (refcount_remove(&p->p_refcnt, &arc_prune_list) == 0) {
-		refcount_destroy(&p->p_refcnt);
-		kmem_free(p, sizeof (*p));
-	}
+	if (refcount_remove(&p->p_refcnt, &arc_prune_list) > 0)
+		wait = B_TRUE;
 	mutex_exit(&arc_prune_mtx);
+
+	/* wait for arc_prune_task to finish */
+	if (wait)
+		taskq_wait_outstanding(arc_prune_taskq, 0);
+	ASSERT0(refcount_count(&p->p_refcnt));
+	refcount_destroy(&p->p_refcnt);
+	kmem_free(p, sizeof (*p));
 }
 
 void
@@ -5116,7 +5165,9 @@ arc_tempreserve_space(uint64_t reserve, uint64_t txg)
 	int error;
 	uint64_t anon_size;
 
-	if (reserve > arc_c/4 && !arc_no_grow)
+	if (!arc_no_grow &&
+	    reserve > arc_c/4 &&
+	    reserve * 4 > (2ULL << SPA_MAXBLOCKSHIFT))
 		arc_c = MIN(arc_c_max, reserve * 4);
 
 	/*
@@ -5260,7 +5311,7 @@ arc_tuning_update(void)
 		arc_c_max = zfs_arc_max;
 		arc_c = arc_c_max;
 		arc_p = (arc_c >> 1);
-		arc_meta_limit = MIN(arc_meta_limit, arc_c_max);
+		arc_meta_limit = MIN(arc_meta_limit, (3 * arc_c_max) / 4);
 	}
 
 	/* Valid range: 32M - <arc_c_max> */
@@ -5359,10 +5410,20 @@ arc_init(void)
 	arc_need_free = 0;
 #endif
 
-	/* Set min cache to allow safe operation of arc_adapt() */
-	arc_c_min = 2ULL << SPA_MAXBLOCKSHIFT;
 	/* Set max to 1/2 of all memory */
 	arc_c_max = allmem / 2;
+
+	/*
+	 * In userland, there's only the memory pressure that we artificially
+	 * create (see arc_available_memory()).  Don't let arc_c get too
+	 * small, because it can cause transactions to be larger than
+	 * arc_c, causing arc_tempreserve_space() to fail.
+	 */
+#ifndef	_KERNEL
+	arc_c_min = MAX(arc_c_max / 2, 2ULL << SPA_MAXBLOCKSHIFT);
+#else
+	arc_c_min = 2ULL << SPA_MAXBLOCKSHIFT;
+#endif
 
 	arc_c = arc_c_max;
 	arc_p = (arc_c >> 1);
@@ -5489,11 +5550,11 @@ arc_init(void)
 	 * zfs_dirty_data_max_max (default 25% of physical memory).
 	 */
 	if (zfs_dirty_data_max_max == 0)
-		zfs_dirty_data_max_max = physmem * PAGESIZE *
+		zfs_dirty_data_max_max = (uint64_t)physmem * PAGESIZE *
 		    zfs_dirty_data_max_max_percent / 100;
 
 	if (zfs_dirty_data_max == 0) {
-		zfs_dirty_data_max = physmem * PAGESIZE *
+		zfs_dirty_data_max = (uint64_t)physmem * PAGESIZE *
 		    zfs_dirty_data_max_percent / 100;
 		zfs_dirty_data_max = MIN(zfs_dirty_data_max,
 		    zfs_dirty_data_max_max);
@@ -5966,7 +6027,20 @@ top:
 		 */
 		l2arc_release_cdata_buf(hdr);
 
-		if (zio->io_error != 0) {
+		/*
+		 * Skipped - drop L2ARC entry and mark the header as no
+		 * longer L2 eligibile.
+		 */
+		if (hdr->b_l2hdr.b_daddr == L2ARC_ADDR_UNSET) {
+			list_remove(buflist, hdr);
+			hdr->b_flags &= ~ARC_FLAG_HAS_L2HDR;
+			hdr->b_flags &= ~ARC_FLAG_L2CACHE;
+
+			ARCSTAT_BUMP(arcstat_l2_writes_skip_toobig);
+
+			(void) refcount_remove_many(&dev->l2ad_alloc,
+			    hdr->b_l2hdr.b_asize, hdr);
+		} else if (zio->io_error != 0) {
 			/*
 			 * Error - drop L2ARC entry.
 			 */
@@ -6037,6 +6111,8 @@ l2arc_read_done(zio_t *zio)
 	if (cb->l2rcb_compress != ZIO_COMPRESS_OFF)
 		l2arc_decompress_zio(zio, hdr, cb->l2rcb_compress);
 	ASSERT(zio->io_data != NULL);
+	ASSERT3U(zio->io_size, ==, hdr->b_size);
+	ASSERT3U(BP_GET_LSIZE(&cb->l2rcb_bp), ==, hdr->b_size);
 
 	/*
 	 * Check this survived the L2ARC journey.
@@ -6073,7 +6149,7 @@ l2arc_read_done(zio_t *zio)
 			ASSERT(!pio || pio->io_child_type == ZIO_CHILD_LOGICAL);
 
 			zio_nowait(zio_read(pio, cb->l2rcb_spa, &cb->l2rcb_bp,
-			    buf->b_data, zio->io_size, arc_read_done, buf,
+			    buf->b_data, hdr->b_size, arc_read_done, buf,
 			    zio->io_priority, cb->l2rcb_flags, &cb->l2rcb_zb));
 		}
 	}
@@ -6381,7 +6457,7 @@ l2arc_write_buffers(spa_t *spa, l2arc_dev_t *dev, uint64_t target_sz,
 			 * can't access without holding the ARC list locks
 			 * (which we want to avoid during compression/writing)
 			 */
-			HDR_SET_COMPRESS(hdr, ZIO_COMPRESS_OFF);
+			hdr->b_l2hdr.b_compress = ZIO_COMPRESS_OFF;
 			hdr->b_l2hdr.b_asize = hdr->b_size;
 			hdr->b_l2hdr.b_hits = 0;
 			hdr->b_l1hdr.b_tmp_cdata = hdr->b_l1hdr.b_buf->b_data;
@@ -6511,6 +6587,16 @@ l2arc_write_buffers(spa_t *spa, l2arc_dev_t *dev, uint64_t target_sz,
 		if (buf_sz != 0) {
 			uint64_t buf_a_sz;
 
+			/*
+			 * Buffers which are larger than l2arc_max_block_size
+			 * after compression are skipped and removed from L2
+			 * eligibility.
+			 */
+			if (buf_sz > l2arc_max_block_size) {
+				hdr->b_l2hdr.b_daddr = L2ARC_ADDR_UNSET;
+				continue;
+			}
+
 			wzio = zio_write_phys(pio, dev->l2ad_vdev,
 			    dev->l2ad_hand, buf_sz, buf_data, ZIO_CHECKSUM_OFF,
 			    NULL, NULL, ZIO_PRIORITY_ASYNC_WRITE,
@@ -6587,7 +6673,7 @@ l2arc_compress_buf(arc_buf_hdr_t *hdr)
 	l2hdr = &hdr->b_l2hdr;
 
 	ASSERT(HDR_HAS_L1HDR(hdr));
-	ASSERT(HDR_GET_COMPRESS(hdr) == ZIO_COMPRESS_OFF);
+	ASSERT3U(l2hdr->b_compress, ==, ZIO_COMPRESS_OFF);
 	ASSERT(hdr->b_l1hdr.b_tmp_cdata != NULL);
 
 	len = l2hdr->b_asize;
@@ -6605,7 +6691,7 @@ l2arc_compress_buf(arc_buf_hdr_t *hdr)
 	if (csize == 0) {
 		/* zero block, indicate that there's nothing to write */
 		zio_data_buf_free(cdata, len);
-		HDR_SET_COMPRESS(hdr, ZIO_COMPRESS_EMPTY);
+		l2hdr->b_compress = ZIO_COMPRESS_EMPTY;
 		l2hdr->b_asize = 0;
 		hdr->b_l1hdr.b_tmp_cdata = NULL;
 		ARCSTAT_BUMP(arcstat_l2_compress_zeros);
@@ -6615,7 +6701,7 @@ l2arc_compress_buf(arc_buf_hdr_t *hdr)
 		 * Compression succeeded, we'll keep the cdata around for
 		 * writing and release it afterwards.
 		 */
-		HDR_SET_COMPRESS(hdr, ZIO_COMPRESS_LZ4);
+		l2hdr->b_compress = ZIO_COMPRESS_LZ4;
 		l2hdr->b_asize = csize;
 		hdr->b_l1hdr.b_tmp_cdata = cdata;
 		ARCSTAT_BUMP(arcstat_l2_compress_successes);
@@ -6702,9 +6788,11 @@ l2arc_decompress_zio(zio_t *zio, arc_buf_hdr_t *hdr, enum zio_compress c)
 static void
 l2arc_release_cdata_buf(arc_buf_hdr_t *hdr)
 {
-	enum zio_compress comp = HDR_GET_COMPRESS(hdr);
+	enum zio_compress comp;
 
 	ASSERT(HDR_HAS_L1HDR(hdr));
+	ASSERT(HDR_HAS_L2HDR(hdr));
+	comp = hdr->b_l2hdr.b_compress;
 	ASSERT(comp == ZIO_COMPRESS_OFF || L2ARC_IS_VALID_COMPRESS(comp));
 
 	if (comp == ZIO_COMPRESS_OFF) {
@@ -7070,6 +7158,9 @@ MODULE_PARM_DESC(l2arc_headroom, "Number of max device writes to precache");
 
 module_param(l2arc_headroom_boost, ulong, 0644);
 MODULE_PARM_DESC(l2arc_headroom_boost, "Compressed l2arc_headroom multiplier");
+
+module_param(l2arc_max_block_size, ulong, 0644);
+MODULE_PARM_DESC(l2arc_max_block_size, "Skip L2ARC buffers larger than N");
 
 module_param(l2arc_feed_secs, ulong, 0644);
 MODULE_PARM_DESC(l2arc_feed_secs, "Seconds between L2ARC writing");

@@ -1457,7 +1457,7 @@ zfs_aclset_common(znode_t *zp, zfs_acl_t *aclp, cred_t *cr, dmu_tx_t *tx)
 	if (ace_trivial_common(aclp, 0, zfs_ace_walk) == 0)
 		zp->z_pflags |= ZFS_ACL_TRIVIAL;
 
-	zfs_tstamp_update_setup(zp, STATE_CHANGED, NULL, ctime, B_TRUE);
+	zfs_tstamp_update_setup(zp, STATE_CHANGED, NULL, ctime);
 	return (sa_bulk_update(zp->z_sa_hdl, bulk, count, tx));
 }
 
@@ -1744,9 +1744,7 @@ zfs_acl_ids_create(znode_t *dzp, int flag, vattr_t *vap, cred_t *cr,
 	int		error;
 	zfs_sb_t	*zsb = ZTOZSB(dzp);
 	zfs_acl_t	*paclp;
-#ifdef HAVE_KSID
 	gid_t		gid;
-#endif /* HAVE_KSID */
 	boolean_t	need_chmod = B_TRUE;
 	boolean_t	inherited = B_FALSE;
 
@@ -1760,7 +1758,6 @@ zfs_acl_ids_create(znode_t *dzp, int flag, vattr_t *vap, cred_t *cr,
 
 	acl_ids->z_fuid = vap->va_uid;
 	acl_ids->z_fgid = vap->va_gid;
-#ifdef HAVE_KSID
 	/*
 	 * Determine uid and gid.
 	 */
@@ -1812,7 +1809,6 @@ zfs_acl_ids_create(znode_t *dzp, int flag, vattr_t *vap, cred_t *cr,
 			}
 		}
 	}
-#endif /* HAVE_KSID */
 
 	/*
 	 * If we're creating a directory, and the parent directory has the

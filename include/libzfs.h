@@ -21,10 +21,11 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2013 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
  * Copyright (c) 2013 Steven Hartland. All rights reserved.
  * Copyright 2013 Nexenta Systems, Inc. All rights reserved.
+ * Copyright (c) 2016, Intel Corporation.
  */
 
 #ifndef	_LIBZFS_H
@@ -58,13 +59,14 @@ extern "C" {
  */
 #define	DISK_ROOT		"/dev"
 #define	UDISK_ROOT		"/dev/disk"
+#define	ZVOL_ROOT		"/dev/zvol"
 
 /*
  * Default wait time for a device name to be created.
  */
 #define	DISK_LABEL_WAIT		(30 * 1000)  /* 30 seconds */
 
-#define	DEFAULT_IMPORT_PATH_SIZE	7
+#define	DEFAULT_IMPORT_PATH_SIZE	9
 extern char *zpool_default_import_path[DEFAULT_IMPORT_PATH_SIZE];
 
 /*
@@ -248,6 +250,7 @@ typedef struct splitflags {
 
 	/* after splitting, import the pool */
 	int import : 1;
+	int name_flags;
 } splitflags_t;
 
 /*
@@ -284,8 +287,6 @@ extern int zpool_label_disk(libzfs_handle_t *, zpool_handle_t *, char *);
  */
 extern int zpool_set_prop(zpool_handle_t *, const char *, const char *);
 extern int zpool_get_prop(zpool_handle_t *, zpool_prop_t, char *,
-    size_t proplen, zprop_source_t *);
-extern int zpool_get_prop_literal(zpool_handle_t *, zpool_prop_t, char *,
     size_t proplen, zprop_source_t *, boolean_t literal);
 extern uint64_t zpool_get_prop_int(zpool_handle_t *, zpool_prop_t,
     zprop_source_t *);
@@ -342,7 +343,7 @@ typedef enum {
 	ZPOOL_STATUS_VERSION_OLDER,	/* older legacy on-disk version */
 	ZPOOL_STATUS_FEAT_DISABLED,	/* supported features are disabled */
 	ZPOOL_STATUS_RESILVERING,	/* device being resilvered */
-	ZPOOL_STATUS_OFFLINE_DEV,	/* device online */
+	ZPOOL_STATUS_OFFLINE_DEV,	/* device offline */
 	ZPOOL_STATUS_REMOVED_DEV,	/* removed device */
 
 	/*
@@ -390,6 +391,7 @@ typedef struct importargs {
 	int can_be_active : 1;	/* can the pool be active?		*/
 	int unique : 1;		/* does 'poolname' already exist?	*/
 	int exists : 1;		/* set on return if pool already exists	*/
+	int scan : 1;		/* prefer scanning to libblkid cache    */
 } importargs_t;
 
 extern nvlist_t *zpool_search_import(libzfs_handle_t *, importargs_t *);
@@ -406,8 +408,15 @@ struct zfs_cmd;
 
 extern const char *zfs_history_event_names[];
 
+typedef enum {
+	VDEV_NAME_PATH		= 1 << 0,
+	VDEV_NAME_GUID		= 1 << 1,
+	VDEV_NAME_FOLLOW_LINKS	= 1 << 2,
+	VDEV_NAME_TYPE_ID	= 1 << 3,
+} vdev_name_t;
+
 extern char *zpool_vdev_name(libzfs_handle_t *, zpool_handle_t *, nvlist_t *,
-    boolean_t verbose);
+    int name_flags);
 extern int zpool_upgrade(zpool_handle_t *, uint64_t);
 extern int zpool_get_history(zpool_handle_t *, nvlist_t **);
 extern int zpool_history_unpack(char *, uint64_t, uint64_t *,
@@ -448,10 +457,11 @@ extern const char *zfs_prop_column_name(zfs_prop_t);
 extern boolean_t zfs_prop_align_right(zfs_prop_t);
 
 extern nvlist_t *zfs_valid_proplist(libzfs_handle_t *, zfs_type_t,
-    nvlist_t *, uint64_t, zfs_handle_t *, const char *);
+    nvlist_t *, uint64_t, zfs_handle_t *, zpool_handle_t *, const char *);
 
 extern const char *zfs_prop_to_name(zfs_prop_t);
 extern int zfs_prop_set(zfs_handle_t *, const char *, const char *);
+extern int zfs_prop_set_list(zfs_handle_t *, nvlist_t *);
 extern int zfs_prop_get(zfs_handle_t *, zfs_prop_t, char *, size_t,
     zprop_source_t *, char *, size_t, boolean_t);
 extern int zfs_prop_get_recvd(zfs_handle_t *, const char *, char *, size_t,
@@ -677,8 +687,8 @@ typedef struct recvflags {
 	boolean_t nomount;
 } recvflags_t;
 
-extern int zfs_receive(libzfs_handle_t *, const char *, recvflags_t *,
-    int, avl_tree_t *);
+extern int zfs_receive(libzfs_handle_t *, const char *, nvlist_t *,
+    recvflags_t *, int, avl_tree_t *);
 
 typedef enum diff_flags {
 	ZFS_DIFF_PARSEABLE = 0x1,
@@ -737,10 +747,21 @@ extern int zfs_unshareall(zfs_handle_t *);
 extern int zfs_deleg_share_nfs(libzfs_handle_t *, char *, char *, char *,
     void *, void *, int, zfs_share_op_t);
 
+enum zfs_nicenum_format {
+	ZFS_NICENUM_1024 = 0,
+	ZFS_NICENUM_TIME = 1,
+	ZFS_NICENUM_RAW = 2
+};
+
 /*
  * Utility function to convert a number to a human-readable form.
  */
 extern void zfs_nicenum(uint64_t, char *, size_t);
+extern void zfs_nicenum_format(uint64_t num, char *buf, size_t buflen,
+    enum zfs_nicenum_format type);
+
+
+extern void zfs_nicetime(uint64_t, char *, size_t);
 extern int zfs_nicestrtonum(libzfs_handle_t *, const char *, uint64_t *);
 
 /*
@@ -789,6 +810,12 @@ extern boolean_t libzfs_fru_compare(libzfs_handle_t *, const char *,
     const char *);
 extern boolean_t libzfs_fru_notself(libzfs_handle_t *, const char *);
 extern int zpool_fru_set(zpool_handle_t *, uint64_t, const char *);
+
+/*
+ * Support for Linux libudev derived persistent device strings
+ */
+extern boolean_t is_mpath_whole_disk(const char *);
+extern void update_vdev_config_dev_strs(nvlist_t *);
 
 #ifdef	__cplusplus
 }

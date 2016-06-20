@@ -24,12 +24,12 @@
  * Portions Copyright 2011 Martin Matuska
  * Portions Copyright 2012 Pawel Jakub Dawidek <pawel@dawidek.net>
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
- * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright 2015 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2014, Joyent, Inc. All rights reserved.
- * Copyright (c) 2011, 2014 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
  * Copyright (c) 2013 Steven Hartland. All rights reserved.
- * Copyright (c) 2014, Nexenta Systems, Inc. All rights reserved.
+ * Copyright (c) 2016 Actifio, Inc. All rights reserved.
  */
 
 /*
@@ -186,11 +186,18 @@
 #include <sys/zfeature.h>
 
 #include <linux/miscdevice.h>
+#include <linux/slab.h>
 
 #include "zfs_namecheck.h"
 #include "zfs_prop.h"
 #include "zfs_deleg.h"
 #include "zfs_comutil.h"
+
+/*
+ * Limit maximum nvlist size.  We don't want users passing in insane values
+ * for zc->zc_nvlist_src_size, since we will need to allocate that much memory.
+ */
+#define	MAX_NVLIST_SRC_SIZE	KMALLOC_MAX_SIZE
 
 kmutex_t zfsdev_state_lock;
 zfsdev_state_t *zfsdev_state_list;
@@ -246,55 +253,6 @@ static int zfs_fill_zplprops_root(uint64_t, nvlist_t *, nvlist_t *,
     boolean_t *);
 int zfs_set_prop_nvlist(const char *, zprop_source_t, nvlist_t *, nvlist_t *);
 static int get_nvlist(uint64_t nvl, uint64_t size, int iflag, nvlist_t **nvp);
-
-#if defined(HAVE_DECLARE_EVENT_CLASS)
-void
-__dprintf(const char *file, const char *func, int line, const char *fmt, ...)
-{
-	const char *newfile;
-	size_t size = 4096;
-	char *buf = kmem_alloc(size, KM_SLEEP);
-	char *nl;
-	va_list adx;
-
-	/*
-	 * Get rid of annoying prefix to filename.
-	 */
-	newfile = strrchr(file, '/');
-	if (newfile != NULL) {
-		newfile = newfile + 1; /* Get rid of leading / */
-	} else {
-		newfile = file;
-	}
-
-	va_start(adx, fmt);
-	(void) vsnprintf(buf, size, fmt, adx);
-	va_end(adx);
-
-	/*
-	 * Get rid of trailing newline.
-	 */
-	nl = strrchr(buf, '\n');
-	if (nl != NULL)
-		*nl = '\0';
-
-	/*
-	 * To get this data enable the zfs__dprintf trace point as shown:
-	 *
-	 * # Enable zfs__dprintf tracepoint, clear the tracepoint ring buffer
-	 * $ echo 1 > /sys/module/zfs/parameters/zfs_flags
-	 * $ echo 1 > /sys/kernel/debug/tracing/events/zfs/enable
-	 * $ echo 0 > /sys/kernel/debug/tracing/trace
-	 *
-	 * # Dump the ring buffer.
-	 * $ cat /sys/kernel/debug/tracing/trace
-	 */
-	DTRACE_PROBE4(zfs__dprintf,
-	    char *, newfile, char *, func, int, line, char *, buf);
-
-	kmem_free(buf, size);
-}
-#endif /* HAVE_DECLARE_EVENT_CLASS */
 
 static void
 history_str_free(char *buf)
@@ -1449,7 +1407,7 @@ zfs_sb_hold(const char *name, void *tag, zfs_sb_t **zsbp, boolean_t writer)
 	int error = 0;
 
 	if (get_zfs_sb(name, zsbp) != 0)
-		error = zfs_sb_create(name, zsbp);
+		error = zfs_sb_create(name, NULL, zsbp);
 	if (error == 0) {
 		rrm_enter(&(*zsbp)->z_teardown_lock, (writer) ? RW_WRITER :
 		    RW_READER, tag);
@@ -1549,8 +1507,7 @@ zfs_ioc_pool_destroy(zfs_cmd_t *zc)
 	int error;
 	zfs_log_history(zc);
 	error = spa_destroy(zc->zc_name);
-	if (error == 0)
-		zvol_remove_minors(zc->zc_name);
+
 	return (error);
 }
 
@@ -1586,9 +1543,7 @@ zfs_ioc_pool_import(zfs_cmd_t *zc)
 	}
 
 	nvlist_free(config);
-
-	if (props)
-		nvlist_free(props);
+	nvlist_free(props);
 
 	return (error);
 }
@@ -1602,8 +1557,7 @@ zfs_ioc_pool_export(zfs_cmd_t *zc)
 
 	zfs_log_history(zc);
 	error = spa_export(zc->zc_name, NULL, force, hardforce);
-	if (error == 0)
-		zvol_remove_minors(zc->zc_name);
+
 	return (error);
 }
 
@@ -2444,7 +2398,7 @@ zfs_prop_set_special(const char *dsname, zprop_source_t source,
 		err = zvol_set_volsize(dsname, intval);
 		break;
 	case ZFS_PROP_SNAPDEV:
-		err = zvol_set_snapdev(dsname, intval);
+		err = zvol_set_snapdev(dsname, source, intval);
 		break;
 	case ZFS_PROP_VERSION:
 	{
@@ -3201,7 +3155,7 @@ zfs_ioc_create(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
 			volblocksize = zfs_prop_default_numeric(
 			    ZFS_PROP_VOLBLOCKSIZE);
 
-		if ((error = zvol_check_volblocksize(
+		if ((error = zvol_check_volblocksize(fsname,
 		    volblocksize)) != 0 ||
 		    (error = zvol_check_volsize(volsize,
 		    volblocksize)) != 0)
@@ -3235,15 +3189,26 @@ zfs_ioc_create(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
 	if (error == 0) {
 		error = zfs_set_prop_nvlist(fsname, ZPROP_SRC_LOCAL,
 		    nvprops, outnvl);
-		if (error != 0)
-			(void) dsl_destroy_head(fsname);
+		if (error != 0) {
+			spa_t *spa;
+			int error2;
+
+			/*
+			 * Volumes will return EBUSY and cannot be destroyed
+			 * until all asynchronous minor handling has completed.
+			 * Wait for the spa_zvol_taskq to drain then retry.
+			 */
+			error2 = dsl_destroy_head(fsname);
+			while ((error2 == EBUSY) && (type == DMU_OST_ZVOL)) {
+				error2 = spa_open(fsname, &spa, FTAG);
+				if (error2 == 0) {
+					taskq_wait(spa->spa_zvol_taskq);
+					spa_close(spa, FTAG);
+				}
+				error2 = dsl_destroy_head(fsname);
+			}
+		}
 	}
-
-#ifdef _KERNEL
-	if (error == 0 && type == DMU_OST_ZVOL)
-		zvol_create_minors(fsname);
-#endif
-
 	return (error);
 }
 
@@ -3286,12 +3251,6 @@ zfs_ioc_clone(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
 		if (error != 0)
 			(void) dsl_destroy_head(fsname);
 	}
-
-#ifdef _KERNEL
-	if (error == 0)
-		zvol_create_minors(fsname);
-#endif
-
 	return (error);
 }
 
@@ -3354,11 +3313,6 @@ zfs_ioc_snapshot(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 
 	error = dsl_dataset_snapshot(snaps, props, outnvl);
 
-#ifdef _KERNEL
-	if (error == 0)
-		zvol_create_minors(poolname);
-#endif
-
 	return (error);
 }
 
@@ -3410,37 +3364,20 @@ zfs_ioc_log_history(const char *unused, nvlist_t *innvl, nvlist_t *outnvl)
  * This function is best-effort.  Callers must deal gracefully if it
  * remains mounted (or is remounted after this call).
  *
- * XXX: This function should detect a failure to unmount a snapdir of a dataset
- * and return the appropriate error code when it is mounted. Its Illumos and
- * FreeBSD counterparts do this. We do not do this on Linux because there is no
- * clear way to access the mount information that FreeBSD and Illumos use to
- * distinguish between things with mounted snapshot directories, and things
- * without mounted snapshot directories, which include zvols. Returning a
- * failure for the latter causes `zfs destroy` to fail on zvol snapshots.
+ * Returns 0 if the argument is not a snapshot, or it is not currently a
+ * filesystem, or we were able to unmount it.  Returns error code otherwise.
  */
 int
 zfs_unmount_snap(const char *snapname)
 {
-	zfs_sb_t *zsb = NULL;
-	char *dsname;
-	char *fullname;
-	char *ptr;
+	int err;
 
-	if ((ptr = strchr(snapname, '@')) == NULL)
+	if (strchr(snapname, '@') == NULL)
 		return (0);
 
-	dsname = kmem_alloc(ptr - snapname + 1, KM_SLEEP);
-	strlcpy(dsname, snapname, ptr - snapname + 1);
-	fullname = strdup(snapname);
-
-	if (zfs_sb_hold(dsname, FTAG, &zsb, B_FALSE) == 0) {
-		ASSERT(!dsl_pool_config_held(dmu_objset_pool(zsb->z_os)));
-		(void) zfsctl_unmount_snapshot(zsb, fullname, MNT_FORCE);
-		zfs_sb_rele(zsb, FTAG);
-	}
-
-	kmem_free(dsname, ptr - snapname + 1);
-	strfree(fullname);
+	err = zfsctl_snapshot_unmount((char *)snapname, MNT_FORCE);
+	if (err != 0 && err != ENOENT)
+		return (SET_ERROR(err));
 
 	return (0);
 }
@@ -3501,7 +3438,6 @@ zfs_ioc_destroy_snaps(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 	for (pair = nvlist_next_nvpair(snaps, NULL); pair != NULL;
 	    pair = nvlist_next_nvpair(snaps, pair)) {
 		(void) zfs_unmount_snap(nvpair_name(pair));
-		(void) zvol_remove_minor(nvpair_name(pair));
 	}
 
 	return (dsl_destroy_snapshots_nvl(snaps, defer, outnvl));
@@ -3627,8 +3563,7 @@ zfs_ioc_destroy(zfs_cmd_t *zc)
 		err = dsl_destroy_snapshot(zc->zc_name, zc->zc_defer_destroy);
 	else
 		err = dsl_destroy_head(zc->zc_name);
-	if (zc->zc_objset_type == DMU_OST_ZVOL && err == 0)
-		(void) zvol_remove_minor(zc->zc_name);
+
 	return (err);
 }
 
@@ -3841,6 +3776,7 @@ zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
 			return (SET_ERROR(ENOTSUP));
 		break;
 
+	case ZFS_PROP_VOLBLOCKSIZE:
 	case ZFS_PROP_RECORDSIZE:
 		/* Record sizes above 128k need the feature to be enabled */
 		if (nvpair_value_uint64(pair, &intval) == 0 &&
@@ -3854,7 +3790,7 @@ zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
 			 */
 			if (zfs_is_bootfs(dsname) &&
 			    intval > SPA_OLD_MAXBLOCKSIZE) {
-				return (SET_ERROR(EDOM));
+				return (SET_ERROR(ERANGE));
 			}
 
 			/*
@@ -3863,7 +3799,7 @@ zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
 			 */
 			if (intval > zfs_max_recordsize ||
 			    intval > SPA_MAXBLOCKSIZE)
-				return (SET_ERROR(EDOM));
+				return (SET_ERROR(ERANGE));
 
 			if ((err = spa_open(dsname, &spa, FTAG)) != 0)
 				return (err);
@@ -4191,11 +4127,6 @@ zfs_ioc_recv(zfs_cmd_t *zc)
 		zfs_ioc_recv_inject_err = B_FALSE;
 		error = 1;
 	}
-#endif
-
-#ifdef _KERNEL
-	if (error == 0)
-		zvol_create_minors(tofs);
 #endif
 
 	/*
@@ -4913,6 +4844,7 @@ zfs_ioc_smb_acl(zfs_cmd_t *zc)
 		if ((error = get_nvlist(zc->zc_nvlist_src,
 		    zc->zc_nvlist_src_size, zc->zc_iflags, &nvlist)) != 0) {
 			VN_RELE(vp);
+			VN_RELE(ZTOV(sharedir));
 			ZFS_EXIT(zsb);
 			return (error);
 		}
@@ -4965,6 +4897,7 @@ zfs_ioc_smb_acl(zfs_cmd_t *zc)
 static int
 zfs_ioc_hold(const char *pool, nvlist_t *args, nvlist_t *errlist)
 {
+	nvpair_t *pair;
 	nvlist_t *holds;
 	int cleanup_fd = -1;
 	int error;
@@ -4973,6 +4906,19 @@ zfs_ioc_hold(const char *pool, nvlist_t *args, nvlist_t *errlist)
 	error = nvlist_lookup_nvlist(args, "holds", &holds);
 	if (error != 0)
 		return (SET_ERROR(EINVAL));
+
+	/* make sure the user didn't pass us any invalid (empty) tags */
+	for (pair = nvlist_next_nvpair(holds, NULL); pair != NULL;
+	    pair = nvlist_next_nvpair(holds, pair)) {
+		char *htag;
+
+		error = nvpair_value_string(pair, &htag);
+		if (error != 0)
+			return (SET_ERROR(error));
+
+		if (strlen(htag) == 0)
+			return (SET_ERROR(EINVAL));
+	}
 
 	if (nvlist_lookup_int32(args, "cleanup_fd", &cleanup_fd) == 0) {
 		error = zfs_onexit_fd_hold(cleanup_fd, &minor);
@@ -5873,7 +5819,23 @@ zfsdev_ioctl(struct file *filp, unsigned cmd, unsigned long arg)
 	}
 
 	zc->zc_iflags = flag & FKIOCTL;
-	if (zc->zc_nvlist_src_size != 0) {
+	if (zc->zc_nvlist_src_size > MAX_NVLIST_SRC_SIZE) {
+		/*
+		 * Make sure the user doesn't pass in an insane value for
+		 * zc_nvlist_src_size.  We have to check, since we will end
+		 * up allocating that much memory inside of get_nvlist().  This
+		 * prevents a nefarious user from allocating tons of kernel
+		 * memory.
+		 *
+		 * Also, we return EINVAL instead of ENOMEM here.  The reason
+		 * being that returning ENOMEM from an ioctl() has a special
+		 * connotation; that the user's size value is too small and
+		 * needs to be expanded to hold the nvlist.  See
+		 * zcmd_expand_dst_nvlist() for details.
+		 */
+		error = SET_ERROR(EINVAL);	/* User's size too big */
+
+	} else if (zc->zc_nvlist_src_size != 0) {
 		error = get_nvlist(zc->zc_nvlist_src, zc->zc_nvlist_src_size,
 		    zc->zc_iflags, &innvl);
 		if (error != 0)
@@ -5907,8 +5869,11 @@ zfsdev_ioctl(struct file *filp, unsigned cmd, unsigned long arg)
 	}
 
 
-	if (error == 0 && !(flag & FKIOCTL))
+	if (error == 0 && !(flag & FKIOCTL)) {
+		cookie = spl_fstrans_mark();
 		error = vec->zvec_secpolicy(zc, innvl, CRED());
+		spl_fstrans_unmark(cookie);
+	}
 
 	if (error != 0)
 		goto out;
@@ -6044,13 +6009,9 @@ zfs_attach(void)
 static void
 zfs_detach(void)
 {
-	int error;
 	zfsdev_state_t *zs, *zsprev = NULL;
 
-	error = misc_deregister(&zfs_misc);
-	if (error != 0)
-		printk(KERN_INFO "ZFS: misc_deregister() failed %d\n", error);
-
+	misc_deregister(&zfs_misc);
 	mutex_destroy(&zfsdev_state_lock);
 
 	for (zs = zfsdev_state_list; zs != NULL; zs = zs->zs_next) {
@@ -6080,23 +6041,23 @@ _init(void)
 {
 	int error;
 
-	error = vn_set_pwd("/");
+	error = -vn_set_pwd("/");
 	if (error) {
 		printk(KERN_NOTICE
 		    "ZFS: Warning unable to set pwd to '/': %d\n", error);
 		return (error);
 	}
 
+	if ((error = -zvol_init()) != 0)
+		return (error);
+
 	spa_init(FREAD | FWRITE);
 	zfs_init();
-
-	if ((error = zvol_init()) != 0)
-		goto out1;
 
 	zfs_ioctl_init();
 
 	if ((error = zfs_attach()) != 0)
-		goto out2;
+		goto out;
 
 	tsd_create(&zfs_fsyncer_key, NULL);
 	tsd_create(&rrw_tsd_key, rrw_tsd_destroy);
@@ -6112,11 +6073,10 @@ _init(void)
 
 	return (0);
 
-out2:
-	(void) zvol_fini();
-out1:
+out:
 	zfs_fini();
 	spa_fini();
+	(void) zvol_fini();
 	printk(KERN_NOTICE "ZFS: Failed to Load ZFS Filesystem v%s-%s%s"
 	    ", rc = %d\n", ZFS_META_VERSION, ZFS_META_RELEASE,
 	    ZFS_DEBUG_STR, error);
@@ -6128,9 +6088,9 @@ static void __exit
 _fini(void)
 {
 	zfs_detach();
-	zvol_fini();
 	zfs_fini();
 	spa_fini();
+	zvol_fini();
 
 	tsd_destroy(&zfs_fsyncer_key);
 	tsd_destroy(&rrw_tsd_key);

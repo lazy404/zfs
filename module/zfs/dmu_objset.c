@@ -26,6 +26,7 @@
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  * Copyright (c) 2015 Nexenta Systems, Inc. All rights reserved.
  * Copyright (c) 2015, STRATO AG, Inc. All rights reserved.
+ * Copyright (c) 2016 Actifio, Inc. All rights reserved.
  */
 
 /* Portions Copyright 2010 Robert Milkowski */
@@ -51,6 +52,7 @@
 #include <sys/zfs_onexit.h>
 #include <sys/dsl_destroy.h>
 #include <sys/vdev.h>
+#include <sys/policy.h>
 
 /*
  * Needed to close a window in dnode_move() that allows the objset to be freed
@@ -688,45 +690,12 @@ dmu_objset_evict(objset_t *os)
 	for (t = 0; t < TXG_SIZE; t++)
 		ASSERT(!dmu_objset_is_dirty(os, t));
 
-	if (ds) {
-		if (!ds->ds_is_snapshot) {
-			VERIFY0(dsl_prop_unregister(ds,
-			    zfs_prop_to_name(ZFS_PROP_CHECKSUM),
-			    checksum_changed_cb, os));
-			VERIFY0(dsl_prop_unregister(ds,
-			    zfs_prop_to_name(ZFS_PROP_COMPRESSION),
-			    compression_changed_cb, os));
-			VERIFY0(dsl_prop_unregister(ds,
-			    zfs_prop_to_name(ZFS_PROP_COPIES),
-			    copies_changed_cb, os));
-			VERIFY0(dsl_prop_unregister(ds,
-			    zfs_prop_to_name(ZFS_PROP_DEDUP),
-			    dedup_changed_cb, os));
-			VERIFY0(dsl_prop_unregister(ds,
-			    zfs_prop_to_name(ZFS_PROP_LOGBIAS),
-			    logbias_changed_cb, os));
-			VERIFY0(dsl_prop_unregister(ds,
-			    zfs_prop_to_name(ZFS_PROP_SYNC),
-			    sync_changed_cb, os));
-			VERIFY0(dsl_prop_unregister(ds,
-			    zfs_prop_to_name(ZFS_PROP_REDUNDANT_METADATA),
-			    redundant_metadata_changed_cb, os));
-			VERIFY0(dsl_prop_unregister(ds,
-			    zfs_prop_to_name(ZFS_PROP_RECORDSIZE),
-			    recordsize_changed_cb, os));
-		}
-		VERIFY0(dsl_prop_unregister(ds,
-		    zfs_prop_to_name(ZFS_PROP_PRIMARYCACHE),
-		    primary_cache_changed_cb, os));
-		VERIFY0(dsl_prop_unregister(ds,
-		    zfs_prop_to_name(ZFS_PROP_SECONDARYCACHE),
-		    secondary_cache_changed_cb, os));
-	}
+	if (ds)
+		dsl_prop_unregister_all(ds, os);
 
 	if (os->os_sa)
 		sa_tear_down(os);
 
-	os->os_evicting = B_TRUE;
 	dmu_objset_evict_dbufs(os);
 
 	mutex_enter(&os->os_lock);
@@ -901,6 +870,8 @@ dmu_objset_create_sync(void *arg, dmu_tx_t *tx)
 	}
 
 	spa_history_log_internal_ds(ds, "create", tx, "");
+	zvol_create_minors(dp->dp_spa, doca->doca_name, B_TRUE);
+
 	dsl_dataset_rele(ds, FTAG);
 	dsl_dir_rele(pdd, FTAG);
 }
@@ -994,6 +965,7 @@ dmu_objset_clone_sync(void *arg, dmu_tx_t *tx)
 	dsl_dataset_name(origin, namebuf);
 	spa_history_log_internal_ds(ds, "clone", tx,
 	    "origin=%s (%llu)", namebuf, origin->ds_object);
+	zvol_create_minors(dp->dp_spa, doca->doca_clone, B_TRUE);
 	dsl_dataset_rele(ds, FTAG);
 	dsl_dataset_rele(origin, FTAG);
 	dsl_dir_rele(pdd, FTAG);
@@ -1342,7 +1314,6 @@ dmu_objset_userquota_get_ids(dnode_t *dn, boolean_t before, dmu_tx_t *tx)
 	int flags = dn->dn_id_flags;
 	int error;
 	boolean_t have_spill = B_FALSE;
-	boolean_t have_bonus = B_FALSE;
 
 	if (!dmu_objset_userused_enabled(dn->dn_objset))
 		return;
@@ -1354,21 +1325,8 @@ dmu_objset_userquota_get_ids(dnode_t *dn, boolean_t before, dmu_tx_t *tx)
 	if (before && dn->dn_bonuslen != 0)
 		data = DN_BONUS(dn->dn_phys);
 	else if (!before && dn->dn_bonuslen != 0) {
-		db = dn->dn_bonus;
-		if (db != NULL) {
-			if (!RW_WRITE_HELD(&dn->dn_struct_rwlock)) {
-				have_bonus = dbuf_try_add_ref((dmu_buf_t *)db,
-				    dn->dn_objset, dn->dn_object,
-				    DMU_BONUS_BLKID, FTAG);
-
-				/*
-				 * The hold will fail if the buffer is
-				 * being evicted due to unlink, in which
-				 * case nothing needs to be done.
-				 */
-				if (!have_bonus)
-					return;
-			}
+		if (dn->dn_bonus) {
+			db = dn->dn_bonus;
 			mutex_enter(&db->db_mtx);
 			data = dmu_objset_userquota_find_data(db, tx);
 		} else {
@@ -1443,7 +1401,7 @@ dmu_objset_userquota_get_ids(dnode_t *dn, boolean_t before, dmu_tx_t *tx)
 		dn->dn_id_flags |= DN_ID_CHKED_BONUS;
 	}
 	mutex_exit(&dn->dn_mtx);
-	if (have_spill || have_bonus)
+	if (have_spill)
 		dmu_buf_rele((dmu_buf_t *)db, FTAG);
 }
 
@@ -1832,6 +1790,7 @@ dmu_objset_find_dp(dsl_pool_t *dp, uint64_t ddobj,
 		 * thread suffices. For now, stay single threaded.
 		 */
 		dmu_objset_find_dp_impl(dcp);
+		mutex_destroy(&err_lock);
 
 		return (error);
 	}
@@ -1843,6 +1802,8 @@ dmu_objset_find_dp(dsl_pool_t *dp, uint64_t ddobj,
 	    INT_MAX, 0);
 	if (tq == NULL) {
 		kmem_free(dcp, sizeof (*dcp));
+		mutex_destroy(&err_lock);
+
 		return (SET_ERROR(ENOMEM));
 	}
 	dcp->dc_tq = tq;

@@ -120,6 +120,7 @@ struct vdev_queue {
 	hrtime_t	vq_io_delta_ts;
 	zio_t		vq_io_search; /* used as local for stack reduction */
 	kmutex_t	vq_lock;
+	uint64_t	vq_lastoffset;
 };
 
 /*
@@ -149,8 +150,10 @@ struct vdev {
 	vdev_t		**vdev_child;	/* array of children		*/
 	uint64_t	vdev_children;	/* number of children		*/
 	vdev_stat_t	vdev_stat;	/* virtual device statistics	*/
+	vdev_stat_ex_t	vdev_stat_ex;	/* extended statistics		*/
 	boolean_t	vdev_expanding;	/* expand the vdev?		*/
 	boolean_t	vdev_reopening;	/* reopen in progress?		*/
+	boolean_t	vdev_nonrot;	/* true if solid state		*/
 	int		vdev_open_error; /* error on last open		*/
 	kthread_t	*vdev_open_thread; /* thread opening children	*/
 	uint64_t	vdev_crtxg;	/* txg when top-level was added */
@@ -175,6 +178,7 @@ struct vdev {
 	uint64_t	vdev_islog;	/* is an intent log device	*/
 	uint64_t	vdev_removing;	/* device is being removed?	*/
 	boolean_t	vdev_ishole;	/* is a hole in the namespace 	*/
+	uint64_t	vdev_top_zap;
 
 	/*
 	 * Leaf vdev state.
@@ -213,6 +217,7 @@ struct vdev {
 	spa_aux_vdev_t	*vdev_aux;	/* for l2cache and spares vdevs	*/
 	zio_t		*vdev_probe_zio; /* root of current probe	*/
 	vdev_aux_t	vdev_label_aux;	/* on-disk aux state		*/
+	uint64_t	vdev_leaf_zap;
 
 	/*
 	 * For DTrace to work in userland (libzpool) context, these fields must
